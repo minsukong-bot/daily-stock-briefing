@@ -48,6 +48,11 @@ jobs:
           EOF
           chmod 600 .env
 
+      - name: Diagnose .env (values masked, lengths only)
+        run: |
+          echo "=== .env field char counts ==="
+          awk -F= '{ printf "%s=<%d chars>\n", $1, length($2) }' .env
+
       - name: Run stock briefing generator
         env:
           PYTHONUTF8: "1"
