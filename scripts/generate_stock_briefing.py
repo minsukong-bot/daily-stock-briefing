@@ -3,15 +3,19 @@
 
 흐름:
   1. KOSPI / KOSDAQ 1주 변동률 (FinanceDataReader)
-  2. 시총 5,000억 이상 종목 중 1주 변동률 절대값 Top 10
-  3. 향후 전망 — Google News RSS (증시 전망 / 코스피 전망)
-  4. 텔레그램 HTML 메시지 발송 (scripts/send_telegram.py 호출)
+  2. 시총 5,000억 이상 종목 1주 변동률 절대값 Top 10
+  3. 같은 모집단 1개월 변동률 절대값 Top 10
+  4. 향후 전망 — Google News RSS 3섹션 (증시 / 반도체 / 방산)
+  5. 텔레그램 HTML 메시지 발송 (scripts/send_telegram.py 호출)
+
+종목 fetch는 한 번 (영업일 ~30일치)으로 1주/1개월 두 변동률을 동시에 계산한다.
 """
 from __future__ import annotations
 
 import datetime as dt
 import subprocess
 import sys
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 from pathlib import Path
@@ -25,21 +29,21 @@ LOG_DIR.mkdir(exist_ok=True)
 
 KST = dt.timezone(dt.timedelta(hours=9))
 TODAY = dt.datetime.now(KST).date()
-LOOKBACK_CALENDAR_DAYS = 14
+LOOKBACK_CALENDAR_DAYS = 45  # 영업일 ~30개 + 안전 마진 (1개월 변동률 계산용)
+INDEX_LOOKBACK_DAYS = 14
 MIN_MARCAP = 500_000_000_000
 TOP_N = 10
-NEWS_LIMIT = 6
+NEWS_PER_TOPIC = 3
 MAX_WORKERS = 12
 
-NEWS_FEEDS = [
-    (
-        "증시 전망",
-        "https://news.google.com/rss/search?q=%EC%A6%9D%EC%8B%9C+%EC%A0%84%EB%A7%9D&hl=ko&gl=KR&ceid=KR:ko",
-    ),
-    (
-        "코스피 전망",
-        "https://news.google.com/rss/search?q=%EC%BD%94%EC%8A%A4%ED%94%BC+%EC%A0%84%EB%A7%9D&hl=ko&gl=KR&ceid=KR:ko",
-    ),
+# 영업일 인덱스 (오늘이 -1, 1주 ≈ 5영업일 전 = -6, 1개월 ≈ 21영업일 전 = -22)
+BIZDAYS_1W = 6
+BIZDAYS_1M = 22
+
+NEWS_TOPICS: list[tuple[str, list[str]]] = [
+    ("증시 전망", ["증시 전망", "코스피 전망"]),
+    ("반도체 전망", ["반도체 전망", "메모리 반도체 업황"]),
+    ("방산 전망", ["방산 전망", "K방산 수출"]),
 ]
 
 
@@ -49,7 +53,7 @@ def log(msg: str) -> None:
 
 def fetch_index(name: str, code: str) -> dict | None:
     end = TODAY
-    start = end - dt.timedelta(days=LOOKBACK_CALENDAR_DAYS)
+    start = end - dt.timedelta(days=INDEX_LOOKBACK_DAYS)
     try:
         df = fdr.DataReader(code, start, end)
     except Exception as e:
@@ -60,7 +64,7 @@ def fetch_index(name: str, code: str) -> dict | None:
         return None
     closes = df["Close"]
     last = float(closes.iloc[-1])
-    base_idx = -6 if len(closes) >= 6 else 0
+    base_idx = -BIZDAYS_1W if len(closes) >= BIZDAYS_1W else 0
     base = float(closes.iloc[base_idx])
     return {
         "name": name,
@@ -81,21 +85,32 @@ def fetch_one_stock(code: str, name: str, marcap: float, start, end) -> dict | N
         return None
     closes = df["Close"]
     last = float(closes.iloc[-1])
-    base_idx = -6 if len(closes) >= 6 else 0
-    base = float(closes.iloc[base_idx])
-    if base <= 0:
+    if last <= 0:
+        return None
+
+    def pct_for(bizdays: int) -> float | None:
+        idx = -bizdays if len(closes) >= bizdays else 0
+        base = float(closes.iloc[idx])
+        if base <= 0:
+            return None
+        return (last / base - 1) * 100
+
+    p1w = pct_for(BIZDAYS_1W)
+    p1m = pct_for(BIZDAYS_1M)
+    if p1w is None and p1m is None:
         return None
     return {
         "code": code,
         "name": name,
         "marcap": marcap,
         "last": last,
-        "base": base,
-        "pct": (last / base - 1) * 100,
+        "pct_1w": p1w,
+        "pct_1m": p1m,
     }
 
 
-def fetch_top_movers() -> list[dict]:
+def fetch_all_movers() -> list[dict]:
+    """시총 임계값 이상 종목의 1주/1개월 변동률을 한 번의 fetch로 산출."""
     listing = fdr.StockListing("KRX")
     listing = listing[listing["Marcap"].fillna(0) >= MIN_MARCAP].copy()
     log(f"INFO: 시총 {MIN_MARCAP/1e8:,.0f}억 이상 = {len(listing)} 종목 스캔")
@@ -118,30 +133,36 @@ def fetch_top_movers() -> list[dict]:
                 results.append(r)
 
     log(f"INFO: 변동률 산출 성공 = {len(results)} 종목")
-    results.sort(key=lambda x: abs(x["pct"]), reverse=True)
-    return results[:TOP_N]
+    return results
 
 
-def fetch_news() -> list[dict]:
+def top_n(rows: list[dict], key: str, n: int = TOP_N) -> list[dict]:
+    valid = [r for r in rows if r.get(key) is not None]
+    valid.sort(key=lambda x: abs(x[key]), reverse=True)
+    return valid[:n]
+
+
+def fetch_news_for_topic(queries: list[str], limit: int) -> list[dict]:
     out: list[dict] = []
-    seen_titles: set[str] = set()
-    for src, url in NEWS_FEEDS:
+    seen: set[str] = set()
+    for q in queries:
+        url = (
+            "https://news.google.com/rss/search?q="
+            + urllib.parse.quote_plus(q)
+            + "&hl=ko&gl=KR&ceid=KR:ko"
+        )
         try:
             feed = feedparser.parse(url)
         except Exception as e:
-            log(f"WARN: feed {src} failed: {e}")
+            log(f"WARN: feed '{q}' failed: {e}")
             continue
-        for entry in feed.entries[:5]:
-            title = (entry.get("title") or "(제목 없음)").strip()
-            if title in seen_titles:
+        for entry in feed.entries[:6]:
+            title = (entry.get("title") or "").strip()
+            if not title or title in seen:
                 continue
-            seen_titles.add(title)
-            out.append({
-                "src": src,
-                "title": title,
-                "link": entry.get("link", ""),
-            })
-            if len(out) >= NEWS_LIMIT:
+            seen.add(title)
+            out.append({"title": title, "link": entry.get("link", "")})
+            if len(out) >= limit:
                 return out
     return out
 
@@ -159,9 +180,41 @@ def fmt_pct(p: float) -> str:
     return f"{sign}{p:.2f}%"
 
 
-def build_message(indices: list, movers: list[dict], news: list[dict]) -> str:
+def render_movers_section(title: str, movers: list[dict], pct_key: str) -> list[str]:
+    lines = [f"<b>{title}</b>"]
+    if movers:
+        for idx, m in enumerate(movers, 1):
+            lines.append(
+                f"{idx}. {escape(m['name'])} ({m['code']}) "
+                f"<b>{fmt_pct(m[pct_key])}</b> | {fmt_marcap(m['marcap'])}"
+            )
+    else:
+        lines.append("- (변동률 산출 실패)")
+    lines.append("")
+    return lines
+
+
+def render_news_section(section_no: int, label: str, news: list[dict]) -> list[str]:
+    lines = [f"<b>{section_no}. 향후 전망 — {label}</b>"]
+    if news:
+        for n in news:
+            link = n["link"] or "#"
+            lines.append(f'- <a href="{escape(link)}">{escape(n["title"])}</a>')
+    else:
+        lines.append("- (RSS 수신 실패)")
+    lines.append("")
+    return lines
+
+
+def build_message(
+    indices: list,
+    movers_1w: list[dict],
+    movers_1m: list[dict],
+    news_by_topic: list[tuple[str, list[dict]]],
+) -> str:
     lines = [f"<b>[국내 증시 브리핑] {TODAY.isoformat()} (KST)</b>", ""]
 
+    # 1. 지수
     lines.append("<b>1. 지수 1주 변동</b>")
     if any(indices):
         for i in indices:
@@ -175,31 +228,23 @@ def build_message(indices: list, movers: list[dict], news: list[dict]) -> str:
         lines.append("- (지수 데이터 수신 실패)")
     lines.append("")
 
-    lines.append(
-        f"<b>2. 1주 변동률 Top {TOP_N} (시총 {fmt_marcap(MIN_MARCAP)} 이상)</b>"
+    # 2. 1주 Top 10
+    lines += render_movers_section(
+        f"2. 1주 변동률 Top {TOP_N} (시총 {fmt_marcap(MIN_MARCAP)} 이상)",
+        movers_1w, "pct_1w",
     )
-    if movers:
-        for idx, m in enumerate(movers, 1):
-            lines.append(
-                f"{idx}. {escape(m['name'])} ({m['code']}) "
-                f"<b>{fmt_pct(m['pct'])}</b> | {fmt_marcap(m['marcap'])}"
-            )
-    else:
-        lines.append("- (변동률 산출 실패)")
-    lines.append("")
 
-    lines.append("<b>3. 향후 전망</b>")
-    if news:
-        for n in news:
-            link = n["link"] or "#"
-            lines.append(
-                f'- <a href="{escape(link)}">{escape(n["title"])}</a> '
-                f'<i>({escape(n["src"])})</i>'
-            )
-    else:
-        lines.append("- (RSS 수신 실패)")
+    # 3. 1개월 Top 10
+    lines += render_movers_section(
+        f"3. 1개월 변동률 Top {TOP_N} (시총 {fmt_marcap(MIN_MARCAP)} 이상)",
+        movers_1m, "pct_1m",
+    )
 
-    return "\n".join(lines)
+    # 4~6. 향후 전망 (3섹션)
+    for offset, (label, news) in enumerate(news_by_topic):
+        lines += render_news_section(4 + offset, label, news)
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def send_via_telegram(message: str) -> None:
@@ -221,9 +266,17 @@ def send_via_telegram(message: str) -> None:
 
 def main() -> None:
     indices = [fetch_index("KOSPI", "KS11"), fetch_index("KOSDAQ", "KQ11")]
-    movers = fetch_top_movers()
-    news = fetch_news()
-    msg = build_message(indices, movers, news)
+
+    all_movers = fetch_all_movers()
+    movers_1w = top_n(all_movers, "pct_1w", TOP_N)
+    movers_1m = top_n(all_movers, "pct_1m", TOP_N)
+
+    news_by_topic = [
+        (label, fetch_news_for_topic(queries, NEWS_PER_TOPIC))
+        for label, queries in NEWS_TOPICS
+    ]
+
+    msg = build_message(indices, movers_1w, movers_1m, news_by_topic)
     send_via_telegram(msg)
 
 
