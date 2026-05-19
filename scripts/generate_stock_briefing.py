@@ -2,13 +2,14 @@
 """generate_stock_briefing.py — 일일 국내 증시 브리핑 생성·전송.
 
 흐름:
-  1. KOSPI / KOSDAQ 1주 변동률 (FinanceDataReader)
+  1. 지수 1주 / 1개월 / 6개월 변동률 (KOSPI / KOSDAQ / S&P 500 / NASDAQ)
   2. 시총 5,000억 이상 종목 1주 변동률 절대값 Top 10
   3. 같은 모집단 1개월 변동률 절대값 Top 10
   4. 향후 전망 — Google News RSS 3섹션 (증시 / 반도체 / 방산)
   5. 텔레그램 HTML 메시지 발송 (scripts/send_telegram.py 호출)
 
 종목 fetch는 한 번 (영업일 ~30일치)으로 1주/1개월 두 변동률을 동시에 계산한다.
+지수 fetch는 6개월 lookback (영업일 ~126일, 캘린더 220일)으로 1주/1개월/6개월 동시 산출.
 """
 from __future__ import annotations
 
@@ -29,16 +30,24 @@ LOG_DIR.mkdir(exist_ok=True)
 
 KST = dt.timezone(dt.timedelta(hours=9))
 TODAY = dt.datetime.now(KST).date()
-LOOKBACK_CALENDAR_DAYS = 45  # 영업일 ~30개 + 안전 마진 (1개월 변동률 계산용)
-INDEX_LOOKBACK_DAYS = 14
+LOOKBACK_CALENDAR_DAYS = 45  # 종목용: 영업일 ~30개 + 안전 마진 (1개월 변동률)
+INDEX_LOOKBACK_DAYS = 220    # 지수용: 영업일 ~150개 + 안전 마진 (6개월 변동률)
 MIN_MARCAP = 500_000_000_000
 TOP_N = 10
 NEWS_PER_TOPIC = 3
 MAX_WORKERS = 12
 
-# 영업일 인덱스 (오늘이 -1, 1주 ≈ 5영업일 전 = -6, 1개월 ≈ 21영업일 전 = -22)
-BIZDAYS_1W = 6
-BIZDAYS_1M = 22
+# 영업일 인덱스 (오늘이 -1)
+BIZDAYS_1W = 6     # ~5영업일 전
+BIZDAYS_1M = 22    # ~21영업일 전
+BIZDAYS_6M = 126   # ~125영업일 전
+
+INDICES = [
+    ("KOSPI", "KS11"),
+    ("KOSDAQ", "KQ11"),
+    ("S&P 500", "US500"),
+    ("NASDAQ", "IXIC"),
+]
 
 NEWS_TOPICS: list[tuple[str, list[str]]] = [
     ("증시 전망", ["증시 전망", "코스피 전망"]),
@@ -64,15 +73,24 @@ def fetch_index(name: str, code: str) -> dict | None:
         return None
     closes = df["Close"]
     last = float(closes.iloc[-1])
-    base_idx = -BIZDAYS_1W if len(closes) >= BIZDAYS_1W else 0
-    base = float(closes.iloc[base_idx])
+    if last <= 0:
+        return None
+
+    def pct_for(bizdays: int) -> float | None:
+        idx = -bizdays if len(closes) >= bizdays else 0
+        base = float(closes.iloc[idx])
+        if base <= 0:
+            return None
+        return (last / base - 1) * 100
+
     return {
         "name": name,
         "last": last,
-        "base": base,
-        "pct": (last / base - 1) * 100 if base else 0.0,
         "last_date": closes.index[-1].date(),
-        "base_date": closes.index[base_idx].date(),
+        "pct_1w": pct_for(BIZDAYS_1W),
+        "pct_1m": pct_for(BIZDAYS_1M),
+        "pct_6m": pct_for(BIZDAYS_6M),
+        "rows": len(closes),
     }
 
 
@@ -175,7 +193,9 @@ def fmt_marcap(v: float) -> str:
     return f"{억:,.0f}억"
 
 
-def fmt_pct(p: float) -> str:
+def fmt_pct(p: float | None) -> str:
+    if p is None:
+        return "N/A"
     sign = "+" if p >= 0 else ""
     return f"{sign}{p:.2f}%"
 
@@ -214,15 +234,19 @@ def build_message(
 ) -> str:
     lines = [f"<b>[국내 증시 브리핑] {TODAY.isoformat()} (KST)</b>", ""]
 
-    # 1. 지수
-    lines.append("<b>1. 지수 1주 변동</b>")
+    # 1. 지수 (1주 / 1개월 / 6개월)
+    lines.append("<b>1. 지수 변동률 (1주 / 1개월 / 6개월)</b>")
     if any(indices):
         for i in indices:
             if not i:
                 continue
             lines.append(
-                f"- {escape(i['name'])}: {i['base']:,.2f} ({i['base_date']}) → "
-                f"{i['last']:,.2f} ({i['last_date']}) <b>{fmt_pct(i['pct'])}</b>"
+                f"- <b>{escape(i['name'])}</b> {i['last']:,.2f} ({i['last_date']})"
+            )
+            lines.append(
+                f"  · 1주 <b>{fmt_pct(i['pct_1w'])}</b>"
+                f" · 1개월 <b>{fmt_pct(i['pct_1m'])}</b>"
+                f" · 6개월 <b>{fmt_pct(i['pct_6m'])}</b>"
             )
     else:
         lines.append("- (지수 데이터 수신 실패)")
@@ -265,7 +289,7 @@ def send_via_telegram(message: str) -> None:
 
 
 def main() -> None:
-    indices = [fetch_index("KOSPI", "KS11"), fetch_index("KOSDAQ", "KQ11")]
+    indices = [fetch_index(name, code) for name, code in INDICES]
 
     all_movers = fetch_all_movers()
     movers_1w = top_n(all_movers, "pct_1w", TOP_N)
